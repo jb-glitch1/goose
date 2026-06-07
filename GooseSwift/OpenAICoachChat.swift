@@ -1,10 +1,19 @@
 import Foundation
 
+/// Per-request accumulator for a single streamed Claude response. A reference
+/// type so the streaming closure can mutate it across events without `inout`.
+private final class ClaudeStreamAccumulator {
+  /// Visible text produced in this response (appended live to the UI message).
+  var assistantText = ""
+  /// Tool-use blocks keyed by their content-block index, preserving arrival order.
+  var toolUses: [Int: ClaudeToolUse] = [:]
+  var stopReason: String?
+}
+
 @MainActor
 final class OpenAICoachChatModel: ObservableObject {
   @Published private(set) var isSignedIn = false
-  @Published private(set) var deviceCode: CodexLoginDeviceCode?
-  @Published private(set) var loginStatus = "Not signed in"
+  @Published private(set) var loginStatus = "Add API key"
   @Published private(set) var modelPreset: CoachModelPreset
   @Published private(set) var messages: [CoachChatMessage] = []
   @Published private(set) var streamState: CoachStreamState = .idle
@@ -12,11 +21,11 @@ final class OpenAICoachChatModel: ObservableObject {
 
   private static let modelPresetDefaultsKey = "goose.coach.modelPreset"
   private static let seedPromptText = "What should we look at today?"
-  private var auth: CodexStoredChatGPTAuth?
+  private static let maxToolIterations = 5
+
+  private var apiKey: String?
   private var sendTask: Task<Void, Never>?
-  private var loginTask: Task<Void, Never>?
-  private let authClient = CodexSelfContainedAuthClient()
-  private let client = OpenAIResponsesClient()
+  private let client = ClaudeMessagesClient()
 
   init() {
     let storedRawValue = UserDefaults.standard.string(forKey: Self.modelPresetDefaultsKey)
@@ -29,31 +38,42 @@ final class OpenAICoachChatModel: ObservableObject {
 
   deinit {
     sendTask?.cancel()
-    loginTask?.cancel()
   }
 
+  /// Loads any stored API key from the Keychain and updates signed-in state.
   func refreshAuth() {
-    Task { [weak self, authClient] in
-      do {
-        if let storedAuth = try await authClient.storedAuth(refreshIfNeeded: true) {
-          self?.auth = storedAuth
-          self?.isSignedIn = true
-          self?.deviceCode = nil
-          self?.loginStatus = "Signed in"
-          self?.seedAssistantPromptIfNeeded()
-        } else {
-          self?.auth = nil
-          self?.isSignedIn = false
-          self?.deviceCode = nil
-          self?.loginStatus = "Not signed in"
-        }
-      } catch {
-        self?.auth = nil
-        self?.isSignedIn = false
-        self?.deviceCode = nil
-        self?.loginStatus = "Auth check failed"
-        self?.errorMessage = self?.describe(error) ?? String(describing: error)
-      }
+    if let key = ClaudeAPIKeyStore.load() {
+      apiKey = key
+      isSignedIn = true
+      loginStatus = "Connected"
+      seedAssistantPromptIfNeeded()
+    } else {
+      apiKey = nil
+      isSignedIn = false
+      loginStatus = "Add API key"
+    }
+  }
+
+  /// Validates, stores (Keychain), and activates an Anthropic API key.
+  func signIn(apiKey rawKey: String) {
+    let trimmed = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    errorMessage = nil
+    guard !trimmed.isEmpty else {
+      errorMessage = ClaudeCoachError.missingAPIKey.localizedDescription
+      return
+    }
+    guard trimmed.hasPrefix("sk-ant-") else {
+      errorMessage = "That doesn't look like an Anthropic API key (expected an sk-ant-… key)."
+      return
+    }
+    do {
+      try ClaudeAPIKeyStore.save(trimmed)
+      apiKey = trimmed
+      isSignedIn = true
+      loginStatus = "Connected"
+      seedAssistantPromptIfNeeded()
+    } catch {
+      errorMessage = describe(error)
     }
   }
 
@@ -72,52 +92,17 @@ final class OpenAICoachChatModel: ObservableObject {
     seedAssistantPromptIfNeeded()
   }
 
-  func startOAuthSignIn() {
-    loginTask?.cancel()
-    loginStatus = "Requesting OAuth code"
-    deviceCode = nil
-    errorMessage = nil
-
-    loginTask = Task { [weak self, authClient] in
-      do {
-        let code = try await authClient.requestDeviceCodeWithRetry()
-        self?.deviceCode = CodexLoginDeviceCode(
-          verificationURL: code.verificationURL,
-          userCode: code.userCode
-        )
-        self?.loginStatus = "Waiting for approval"
-
-        let storedAuth = try await authClient.completeDeviceCodeLogin(code)
-        self?.auth = storedAuth
-        self?.isSignedIn = true
-        self?.deviceCode = nil
-        self?.loginStatus = "Signed in"
-        self?.seedAssistantPromptIfNeeded()
-      } catch is CancellationError {
-        self?.loginStatus = "Cancelled"
-      } catch {
-        self?.loginStatus = "OAuth failed"
-        self?.errorMessage = self?.describe(error) ?? String(describing: error)
-      }
-    }
-  }
-
   func signOut() {
     sendTask?.cancel()
     sendTask = nil
-    loginTask?.cancel()
-    loginTask = nil
-    Task { [weak self, authClient] in
-      do {
-        try await authClient.clearStoredAuth()
-      } catch {
-        self?.errorMessage = self?.describe(error) ?? String(describing: error)
-      }
+    do {
+      try ClaudeAPIKeyStore.clear()
+    } catch {
+      errorMessage = describe(error)
     }
-    auth = nil
-    deviceCode = nil
+    apiKey = nil
     isSignedIn = false
-    loginStatus = "Not signed in"
+    loginStatus = "Add API key"
     streamState = .idle
     messages.removeAll()
     CoachConversationStore.clear()
@@ -139,9 +124,9 @@ final class OpenAICoachChatModel: ObservableObject {
     guard !trimmedPrompt.isEmpty, !streamState.isStreaming else {
       return
     }
-    guard let auth else {
+    guard let apiKey else {
       isSignedIn = false
-      errorMessage = OpenAIResponsesError.missingOAuthSession.localizedDescription
+      errorMessage = ClaudeCoachError.missingAPIKey.localizedDescription
       return
     }
 
@@ -160,9 +145,8 @@ final class OpenAICoachChatModel: ObservableObject {
       }
       do {
         try await streamResponseLoop(
-          prompt: trimmedPrompt,
           contextualPrompt: contextualPrompt,
-          auth: auth,
+          apiKey: apiKey,
           assistantID: assistantID,
           healthStore: healthStore,
           appModel: appModel
@@ -185,196 +169,150 @@ final class OpenAICoachChatModel: ObservableObject {
     }
   }
 
+  /// Drives the Anthropic agentic loop: request → stream → if Claude returned
+  /// `tool_use`, run the local tools, append the tool results, and request
+  /// again, until Claude produces a final answer (or the iteration cap is hit).
   private func streamResponseLoop(
-    prompt: String,
     contextualPrompt: String,
-    auth: CodexStoredChatGPTAuth,
+    apiKey: String,
     assistantID: UUID,
     healthStore: HealthDataStore,
     appModel: GooseAppModel
   ) async throws {
-    let activeAuth = try await authClient.storedAuth(refreshIfNeeded: true) ?? auth
-    self.auth = activeAuth
     let activeModelPreset = modelPreset
-    var conversationInput = OpenAICoachRequestFactory.userInput(contextualPrompt)
-    var input: Any = conversationInput
-    var toolMode: OpenAICoachRequestFactory.ToolMode = .required
+    var wireMessages: [[String: Any]] = [ClaudeCoachRequestFactory.userMessage(contextualPrompt)]
 
-    for _ in 0..<2 {
-      var completedToolCalls: [OpenAICoachToolCall] = []
-      var responseID: String?
-      var inFlightToolCalls: [String: OpenAICoachToolCall] = [:]
-
-      let requestBody = OpenAICoachRequestFactory.makeRequest(
-        input: input,
-        toolMode: toolMode,
+    for _ in 0..<Self.maxToolIterations {
+      let accumulator = ClaudeStreamAccumulator()
+      let requestBody = ClaudeCoachRequestFactory.makeRequest(
+        messages: wireMessages,
+        toolMode: .auto,
         modelPreset: activeModelPreset
       )
 
-      try await client.stream(auth: activeAuth, body: requestBody) { [weak self] event in
+      try await client.stream(apiKey: apiKey, body: requestBody) { [weak self] event in
         guard let self else {
           return
         }
-        try handle(
-          event,
-          assistantID: assistantID,
-          inFlightToolCalls: &inFlightToolCalls,
-          completedToolCalls: &completedToolCalls,
-          responseID: &responseID
-        )
+        try handle(event, assistantID: assistantID, accumulator: accumulator)
       }
 
-      guard !completedToolCalls.isEmpty else {
+      let orderedToolUses = accumulator.toolUses
+        .sorted { $0.key < $1.key }
+        .map { $0.value }
+
+      guard accumulator.stopReason == "tool_use", !orderedToolUses.isEmpty else {
         return
       }
 
-      let toolItems = completedToolCalls.flatMap { call -> [[String: Any]] in
-        let output = execute(call: call, healthStore: healthStore, appModel: appModel)
-        updateToolEvent(id: call.id, in: assistantID) { event in
+      // Reconstruct the assistant turn (text + tool_use blocks) for history.
+      var assistantContent: [[String: Any]] = []
+      let trimmedText = accumulator.assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmedText.isEmpty {
+        assistantContent.append(["type": "text", "text": accumulator.assistantText])
+      }
+      for toolUse in orderedToolUses {
+        assistantContent.append([
+          "type": "tool_use",
+          "id": toolUse.id,
+          "name": toolUse.name,
+          "input": toolInputObject(toolUse.inputJSON),
+        ])
+      }
+      wireMessages.append(["role": "assistant", "content": assistantContent])
+
+      // Execute each tool locally and return the results as a user turn.
+      var toolResults: [[String: Any]] = []
+      for toolUse in orderedToolUses {
+        let output = execute(toolName: toolUse.name, healthStore: healthStore, appModel: appModel)
+        updateToolEvent(id: toolUse.id, in: assistantID) { event in
           event.status = "Returned"
           event.resultSummary = summarizeToolOutput(output)
         }
-        return [
-          [
-            "type": "function_call",
-            "id": call.id,
-            "call_id": call.callID,
-            "name": call.name,
-            "arguments": call.arguments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "{}" : call.arguments,
-          ],
-          [
-            "type": "function_call_output",
-            "call_id": call.callID,
-            "output": output,
-          ],
-        ]
+        toolResults.append([
+          "type": "tool_result",
+          "tool_use_id": toolUse.id,
+          "content": output,
+        ])
       }
-      conversationInput.append(contentsOf: toolItems)
-      conversationInput.append(OpenAICoachRequestFactory.finalAnswerInput(originalPrompt: prompt))
-      input = conversationInput
-      toolMode = .none
+      wireMessages.append(["role": "user", "content": toolResults])
     }
 
     if isAssistantTextEmpty(assistantID) {
-      throw OpenAIResponsesError.api("Coach returned tool calls but no final reply.")
+      throw ClaudeCoachError.api("Coach kept requesting tools without a final reply.")
     }
   }
 
   private func handle(
-    _ event: OpenAIResponseStreamEvent,
+    _ event: ClaudeStreamEvent,
     assistantID: UUID,
-    inFlightToolCalls: inout [String: OpenAICoachToolCall],
-    completedToolCalls: inout [OpenAICoachToolCall],
-    responseID: inout String?
+    accumulator: ClaudeStreamAccumulator
   ) throws {
-    responseID = responseID ?? responseIDFrom(event.payload)
-
     switch event.type {
-    case "response.created", "response.in_progress":
-      responseID = responseID ?? responseIDFrom(event.payload)
-    case "response.output_text.delta":
-      if let delta = event.payload["delta"] as? String {
-        appendAssistantText(delta, to: assistantID)
-      }
-    case "response.output_text.done":
-      guard let text = event.payload["text"] as? String, isAssistantTextEmpty(assistantID) else {
+    case "message_start", "ping":
+      break
+    case "content_block_start":
+      guard let index = event.payload["index"] as? Int,
+            let block = event.payload["content_block"] as? [String: Any] else {
         return
       }
-      appendAssistantText(text, to: assistantID)
-    case "response.output_item.added":
-      guard let item = event.payload["item"] as? [String: Any],
-            let call = toolCall(from: item, fallbackID: fallbackToolID(from: event.payload)) else {
+      if block["type"] as? String == "tool_use",
+         let id = block["id"] as? String,
+         let name = block["name"] as? String {
+        accumulator.toolUses[index] = ClaudeToolUse(id: id, name: name, inputJSON: "")
+        upsertToolEvent(
+          CoachToolEvent(id: id, name: name, status: "Calling", arguments: "", resultSummary: nil),
+          in: assistantID
+        )
+      }
+    case "content_block_delta":
+      guard let index = event.payload["index"] as? Int,
+            let delta = event.payload["delta"] as? [String: Any] else {
         return
       }
-      inFlightToolCalls[call.id] = call
-      upsertToolEvent(
-        CoachToolEvent(
-          id: call.id,
-          name: call.name,
-          status: "Calling",
-          arguments: call.arguments,
-          resultSummary: nil
-        ),
-        in: assistantID
-      )
-    case "response.function_call_arguments.delta":
-      let id = fallbackToolID(from: event.payload)
-      guard let id, let delta = event.payload["delta"] as? String else {
+      switch delta["type"] as? String {
+      case "text_delta":
+        if let text = delta["text"] as? String {
+          appendAssistantText(text, to: assistantID)
+        }
+      case "input_json_delta":
+        if let partial = delta["partial_json"] as? String,
+           var toolUse = accumulator.toolUses[index] {
+          toolUse.inputJSON += partial
+          accumulator.toolUses[index] = toolUse
+          updateToolEvent(id: toolUse.id, in: assistantID) { event in
+            event.status = "Preparing"
+            event.arguments = toolUse.inputJSON
+          }
+        }
+      default:
+        break
+      }
+    case "content_block_stop":
+      guard let index = event.payload["index"] as? Int,
+            let toolUse = accumulator.toolUses[index] else {
         return
       }
-      var call = inFlightToolCalls[id] ?? OpenAICoachToolCall(id: id, callID: id, name: "function", arguments: "")
-      call.arguments += delta
-      inFlightToolCalls[id] = call
-      updateToolEvent(id: id, in: assistantID) { event in
-        event.status = "Preparing"
-        event.arguments = call.arguments
+      updateToolEvent(id: toolUse.id, in: assistantID) { event in
+        event.status = "Running"
+        event.arguments = toolUse.inputJSON
       }
-    case "response.function_call_arguments.done":
-      completeToolCall(
-        from: event.payload,
-        assistantID: assistantID,
-        inFlightToolCalls: &inFlightToolCalls,
-        completedToolCalls: &completedToolCalls
-      )
-    case "response.output_item.done":
-      completeToolCall(
-        from: event.payload,
-        assistantID: assistantID,
-        inFlightToolCalls: &inFlightToolCalls,
-        completedToolCalls: &completedToolCalls
-      )
-    case "response.completed":
-      responseID = responseIDFrom(event.payload) ?? responseID
-    case "response.failed", "error":
-      throw OpenAIResponsesError.api(errorMessage(from: event.payload))
+    case "message_delta":
+      if let delta = event.payload["delta"] as? [String: Any],
+         let stopReason = delta["stop_reason"] as? String {
+        accumulator.stopReason = stopReason
+      }
+    case "message_stop":
+      break
+    case "error":
+      throw ClaudeCoachError.api(errorMessage(from: event.payload))
     default:
       break
     }
   }
 
-  private func completeToolCall(
-    from payload: [String: Any],
-    assistantID: UUID,
-    inFlightToolCalls: inout [String: OpenAICoachToolCall],
-    completedToolCalls: inout [OpenAICoachToolCall]
-  ) {
-    let fallbackID = fallbackToolID(from: payload)
-    let finishedCall: OpenAICoachToolCall?
-    if let item = payload["item"] as? [String: Any],
-       let itemCall = toolCall(from: item, fallbackID: fallbackID) {
-      finishedCall = itemCall
-    } else if let fallbackID, var call = inFlightToolCalls[fallbackID] {
-      if let arguments = payload["arguments"] as? String {
-        call.arguments = arguments
-      }
-      finishedCall = call
-    } else {
-      finishedCall = nil
-    }
-
-    guard let finishedCall else {
-      return
-    }
-    guard !completedToolCalls.contains(where: { $0.id == finishedCall.id || $0.callID == finishedCall.callID }) else {
-      return
-    }
-
-    completedToolCalls.append(finishedCall)
-    inFlightToolCalls[finishedCall.id] = finishedCall
-    upsertToolEvent(
-      CoachToolEvent(
-        id: finishedCall.id,
-        name: finishedCall.name,
-        status: "Running",
-        arguments: finishedCall.arguments,
-        resultSummary: nil
-      ),
-      in: assistantID
-    )
-  }
-
   private func execute(
-    call: OpenAICoachToolCall,
+    toolName: String,
     healthStore: HealthDataStore,
     appModel: GooseAppModel
   ) -> String {
@@ -382,9 +320,9 @@ final class OpenAICoachChatModel: ObservableObject {
     let tools = payload["tools"] as? [String: Any] ?? [:]
     let output: Any
 
-    switch call.name {
+    switch toolName {
     case "load_stats", "get_activities", "get_capture_sessions", "get_raw_session_data":
-      output = tools[call.name] ?? ["error": "tool_not_available", "tool": call.name]
+      output = tools[toolName] ?? ["error": "tool_not_available", "tool": toolName]
     case "get_data_gaps":
       output = [
         "readiness": healthStore.metricInputReadinessSummary(),
@@ -395,10 +333,23 @@ final class OpenAICoachChatModel: ObservableObject {
         "capture": tools["get_capture_sessions"] ?? [:],
       ]
     default:
-      output = ["error": "unknown_tool", "tool": call.name]
+      output = ["error": "unknown_tool", "tool": toolName]
     }
 
     return jsonString(output)
+  }
+
+  /// Parses an accumulated tool-input JSON string into an object for the wire
+  /// assistant turn. Goose tools take no input, so an empty/invalid string
+  /// becomes `{}`.
+  private func toolInputObject(_ json: String) -> [String: Any] {
+    let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty,
+          let data = trimmed.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      return [:]
+    }
+    return object
   }
 
   private func appendAssistantText(_ delta: String, to id: UUID) {
@@ -546,33 +497,6 @@ final class OpenAICoachChatModel: ObservableObject {
       )
     )
     persistConversation()
-  }
-
-  private func toolCall(from item: [String: Any], fallbackID: String?) -> OpenAICoachToolCall? {
-    let itemID = item["id"] as? String ?? fallbackID
-    let callID = item["call_id"] as? String ?? itemID
-    let name = item["name"] as? String ?? (item["function"] as? [String: Any])?["name"] as? String
-    let arguments = item["arguments"] as? String ?? (item["function"] as? [String: Any])?["arguments"] as? String ?? ""
-    guard let itemID, let callID, let name else {
-      return nil
-    }
-    return OpenAICoachToolCall(id: itemID, callID: callID, name: name, arguments: arguments)
-  }
-
-  private func fallbackToolID(from payload: [String: Any]) -> String? {
-    payload["item_id"] as? String ??
-      payload["call_id"] as? String ??
-      (payload["output_index"] as? Int).map { "tool-\($0)" }
-  }
-
-  private func responseIDFrom(_ payload: [String: Any]) -> String? {
-    if let responseID = payload["response_id"] as? String {
-      return responseID
-    }
-    if let response = payload["response"] as? [String: Any] {
-      return response["id"] as? String
-    }
-    return nil
   }
 
   private func errorMessage(from payload: [String: Any]) -> String {

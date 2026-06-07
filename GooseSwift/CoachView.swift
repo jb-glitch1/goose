@@ -62,8 +62,8 @@ struct CoachView: View {
       guard requestID > 0, !chat.isSignedIn else {
         return
       }
+      // Present the chat sheet so the API-key connect screen is shown.
       showingChat = true
-      chat.startOAuthSignIn()
     }
     .onChange(of: router.coachPromptRequestID) { _, _ in
       applyRequestedCoachPromptIfNeeded()
@@ -83,9 +83,8 @@ struct CoachView: View {
     } else {
       CoachSignInScreen(
         loginStatus: chat.loginStatus,
-        deviceCode: chat.deviceCode,
         errorMessage: chat.errorMessage,
-        signIn: chat.startOAuthSignIn
+        submit: { chat.signIn(apiKey: $0) }
       )
     }
   }

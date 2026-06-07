@@ -2,9 +2,11 @@ import SwiftUI
 
 struct CoachSignInScreen: View {
   let loginStatus: String
-  let deviceCode: CodexLoginDeviceCode?
   let errorMessage: String?
-  let signIn: () -> Void
+  let submit: (String) -> Void
+
+  @State private var apiKeyDraft = ""
+  @FocusState private var keyFieldFocused: Bool
 
   var body: some View {
     ScrollView {
@@ -16,9 +18,9 @@ struct CoachSignInScreen: View {
             .frame(width: 42, height: 42)
             .background(.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-          Text("Sign in to Coach")
+          Text("Connect Claude")
             .font(.title2.bold())
-          Text("Sign in to stream Coach replies and local Goose tool calls.")
+          Text("Coach streams replies from Anthropic's Claude. Paste your Anthropic API key to connect.")
             .font(.subheadline)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -28,19 +30,16 @@ struct CoachSignInScreen: View {
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
         VStack(alignment: .leading, spacing: 12) {
-          CoachStatusLine(title: "Sign in", value: loginStatus)
+          CoachStatusLine(title: "Status", value: loginStatus)
 
-          if let deviceCode {
-            VStack(alignment: .leading, spacing: 8) {
-              Text(deviceCode.userCode)
-                .font(.title2.monospacedDigit().weight(.bold))
-              Link(deviceCode.verificationURL.absoluteString, destination: deviceCode.verificationURL)
-                .font(.footnote.weight(.semibold))
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-          }
+          SecureField("sk-ant-…", text: $apiKeyDraft)
+            .textFieldStyle(.roundedBorder)
+            .textContentType(.password)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled(true)
+            .submitLabel(.go)
+            .focused($keyFieldFocused)
+            .onSubmit(connect)
 
           if let errorMessage, !errorMessage.isEmpty {
             Label(errorMessage, systemImage: "exclamationmark.triangle")
@@ -49,13 +48,20 @@ struct CoachSignInScreen: View {
               .fixedSize(horizontal: false, vertical: true)
           }
 
-          Button(action: signIn) {
-            Label("Continue", systemImage: "person.crop.circle.badge.checkmark")
+          Button(action: connect) {
+            Label("Connect", systemImage: "key.horizontal")
               .frame(maxWidth: .infinity)
           }
           .buttonStyle(.borderedProminent)
+          .disabled(apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
-          Text("Coach sends the question plus bounded local tool output after approval. Tokens are stored in Keychain.")
+          Link(
+            "Create a key at console.anthropic.com",
+            destination: URL(string: "https://console.anthropic.com/settings/keys")!
+          )
+          .font(.footnote.weight(.semibold))
+
+          Text("Your key is stored only in this device's Keychain and is sent to Anthropic to stream Coach replies. Coach also sends the question plus bounded local tool output. Usage is billed to your Anthropic account.")
             .font(.footnote)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -66,6 +72,16 @@ struct CoachSignInScreen: View {
       .padding(.horizontal, 16)
       .padding(.vertical, 18)
     }
+  }
+
+  private func connect() {
+    let trimmed = apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      return
+    }
+    keyFieldFocused = false
+    submit(trimmed)
+    apiKeyDraft = ""
   }
 }
 

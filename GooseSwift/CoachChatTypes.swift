@@ -55,37 +55,46 @@ struct CoachChatMessage: Identifiable, Equatable, Codable {
 }
 
 enum CoachModelPreset: String, CaseIterable, Identifiable {
-  case gpt55Low
-  case gpt55Medium
-  case gpt55High
+  case opusHigh
+  case sonnetBalanced
+  case haikuFast
 
   var id: String { rawValue }
 
-  static let defaultValue: CoachModelPreset = .gpt55Medium
+  static let defaultValue: CoachModelPreset = .opusHigh
 
   var title: String {
     switch self {
-    case .gpt55Low:
-      return "GPT-5.5 Low"
-    case .gpt55Medium:
-      return "GPT-5.5 Medium"
-    case .gpt55High:
-      return "GPT-5.5 High"
+    case .opusHigh:
+      return "Opus 4.8 · High"
+    case .sonnetBalanced:
+      return "Sonnet 4.6 · Balanced"
+    case .haikuFast:
+      return "Haiku 4.5 · Fast"
     }
   }
 
   var modelID: String {
-    "gpt-5.5"
+    switch self {
+    case .opusHigh:
+      return "claude-opus-4-8"
+    case .sonnetBalanced:
+      return "claude-sonnet-4-6"
+    case .haikuFast:
+      return "claude-haiku-4-5"
+    }
   }
 
-  var effort: String {
+  /// Effort is sent only for models that accept it. Opus and Sonnet support the
+  /// `output_config.effort` control; Haiku rejects it, so it stays `nil`.
+  var effort: String? {
     switch self {
-    case .gpt55Low:
-      return "low"
-    case .gpt55Medium:
-      return "medium"
-    case .gpt55High:
+    case .opusHigh:
       return "high"
+    case .sonnetBalanced:
+      return "medium"
+    case .haikuFast:
+      return nil
     }
   }
 }
