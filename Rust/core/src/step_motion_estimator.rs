@@ -406,8 +406,13 @@ fn persist_validated_raw_motion_step_metric(
         "peak_threshold_i16": report.peak_threshold_i16,
         "min_peak_spacing_samples": report.min_peak_spacing_samples,
         "manual_step_delta_label": report.manual_step_delta,
-        "official_whoop_step_delta_label": report.official_whoop_step_delta,
-        "label_policy": report.label_policy,
+        // Option A: the WHOOP value and the official-label policy string are
+        // never persisted inside the local metric (they would also trip the
+        // store's official-WHOOP marker guard). The metric records only that an
+        // official validation label was supplied; the value itself and the
+        // pass/fail comparison live in the returned report (the validation
+        // record), not in stored local-metric data.
+        "official_label_validated": report.official_whoop_step_delta.is_some(),
         "label_provenance": report.label_provenance.clone(),
     })
     .to_string();
@@ -430,7 +435,6 @@ fn persist_validated_raw_motion_step_metric(
         "official_labels_policy": "validation_label_only",
         "official_whoop_step_delta_used_as_label": report.official_whoop_step_delta.is_some(),
         "manual_step_delta_used_as_label": report.manual_step_delta.is_some(),
-        "label_policy": OFFICIAL_WHOOP_LABEL_POLICY,
     })
     .to_string();
 

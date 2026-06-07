@@ -45,24 +45,27 @@ Note: the two `ios_healthkit_boundary_tests` look for Swift sources under
 a layout mismatch, likely from how the upstream tree was arranged. Adjust the
 test paths or the layout.
 
-## Category B — real logic conflict (needs a decision) ⚠️
+## Category B — privacy-guard logic conflict ✅ RESOLVED (Option A)
 
-These are **not** missing files. They hit a deliberate privacy guard in
-`Rust/core/src/store.rs` (`validate_no_official_whoop_label_marker`) that rejects
-any `official_whoop_*` marker from being stored in a local metric's JSON —
-core to the "never present WHOOP's data as our own" design. But the
-step-validation feature legitimately uses the WHOOP app's step count as a
-comparison **label**. The two collide when writing the metric.
+These four tests hit a deliberate privacy guard in `Rust/core/src/store.rs`
+(`validate_no_official_whoop_label_marker`) that rejects any `official_whoop_*`
+marker from being stored in a local metric's JSON — core to the "never present
+WHOOP's data as our own" design. The step-validation feature legitimately uses
+the WHOOP app's step count as a comparison **label**, and the metric-write path
+was embedding both WHOOP's value and the policy string
+`"official_whoop_values_are_validation_labels_not_inputs"` into the stored
+metric, which the guard (correctly) rejected.
 
-| Test |
-|---|
-| `bridge_writes_validated_raw_motion_step_estimate_as_local_activity_metric` (`bridge_tests.rs`) |
-| `raw_motion_step_estimator_writes_validated_local_estimate_metric_when_requested` (`step_motion_estimator_tests.rs`) |
-| `local_health_validation_suite_applies_manifest_case_defaults` (`local_health_validation_suite_cli_tests.rs`) |
-| `local_health_validation_suite_imports_capture_sqlite_before_running_cases` (`local_health_validation_suite_cli_tests.rs`) |
+**Fix (Option A — keep the guarantee strict):** `persist_validated_raw_motion_step_metric`
+in `src/step_motion_estimator.rs` no longer writes WHOOP's value or the
+official-label policy marker into the stored metric. The metric now records only
+a marker-free `official_label_validated` boolean; WHOOP's number and the
+pass/fail comparison remain in the returned report (the validation record), never
+in persisted local-metric data. The guard is unchanged.
 
-**Not fixed on purpose** — resolving this either loosens a privacy guarantee or
-changes how validation labels are stored, which is a design call for the
-maintainer. Decide the intended behavior, then fix the store path (e.g. keep
-official labels out of the stored metric JSON while still using them for
-validation) rather than weakening the guard.
+| Test | Now |
+|---|---|
+| `bridge_writes_validated_raw_motion_step_estimate_as_local_activity_metric` (`bridge_tests.rs`) | ✅ pass (no test change needed) |
+| `raw_motion_step_estimator_writes_validated_local_estimate_metric_when_requested` (`step_motion_estimator_tests.rs`) | ✅ pass (assertions updated to the Option A behavior) |
+| `local_health_validation_suite_applies_manifest_case_defaults` (`local_health_validation_suite_cli_tests.rs`) | ✅ pass |
+| `local_health_validation_suite_imports_capture_sqlite_before_running_cases` (`local_health_validation_suite_cli_tests.rs`) | ✅ pass |

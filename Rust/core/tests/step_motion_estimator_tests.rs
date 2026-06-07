@@ -131,7 +131,15 @@ fn raw_motion_step_estimator_writes_validated_local_estimate_metric_when_request
     assert_eq!(metric.confidence, 0.65);
     let inputs: serde_json::Value = serde_json::from_str(&metric.inputs_json).unwrap();
     assert_eq!(inputs["manual_step_delta_label"], 5);
-    assert_eq!(inputs["official_whoop_step_delta_label"], 5);
+    // Option A: WHOOP's value is never stored inside the local metric. The
+    // metric only records that an official validation label was supplied; the
+    // value and the pass/fail comparison live in the returned report (the
+    // validation record). The successful write above proves the metric is free
+    // of official-WHOOP markers.
+    assert!(inputs.get("official_whoop_step_delta_label").is_none());
+    assert_eq!(inputs["official_label_validated"], true);
+    assert_eq!(report.official_whoop_step_delta, Some(5));
+    assert_eq!(report.matches_official_label, Some(true));
     assert_eq!(
         inputs["label_provenance"]["official_labels_are_labels"],
         true
